@@ -26,7 +26,7 @@ void startGame() {
     }
     // switch both LEDs off
     // get a random duration between 3 and 5 seconds
-    int random = getRandommsecs(3000, 10000);
+    int random = getRandom(3000, 10000);
     // wait that random duration
     waitMs(random);
     // switch both LEDs ON
@@ -59,7 +59,7 @@ void app_main() {
             setLEDA(0);
         }
 
-        waitMs(5000);
+        waitMs(3000);
         setLEDA(0);
         setLEDB(0);
     }
