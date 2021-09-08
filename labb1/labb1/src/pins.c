@@ -15,14 +15,15 @@ void initPins() {
 
     // ledA (13)
     config.pin_bit_mask = (u_int64_t)1 << ledA;
-    // ledB (12)
-    config.pin_bit_mask |= (u_int64_t)1 << ledB;
     config.mode = GPIO_MODE_OUTPUT;
     config.pull_down_en = 0;
     config.pull_up_en = 0;
     // set the config, this takes care of the registers
     gpio_config(&config);
 
+    // ledB (12)
+    config.pin_bit_mask = (u_int64_t)1 << ledB;
+    gpio_config(&config);
 
     // buttonA (26)
     config.pin_bit_mask = (u_int64_t)1 << buttonA;
