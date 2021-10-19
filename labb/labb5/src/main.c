@@ -1,197 +1,159 @@
 #include <driver/i2c.h>
+#include <esp_sleep.h>
+#include <esp_task_wdt.h>
+#include "readAccel.h"
+#include <esp_pm.h>
+#include <math.h>
+#include "circular_buffer.h"
+#include <stdio.h>
+#include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
-/*
-Example program that reads data from MPU6050
-Connections:
-Vcc -> 3.3V
-GND -> GND
-SCL -> 32
-SDA -> 33
-AD0 -> GND
-*/
-/*
-From the Datasheet, page 33:
-The slave address of the MPU-60X0 is b110100X which is 7 bits long.
-The LSB bit of the 7 bit address is determined by the logic level on pin AD0.
-This allows two MPU-60X0s to be connected to the same I2C bus.
-*/
-// If AD0 is LOW, the I2C address of the board will be 0x68. Otherwise, the
-// address will be 0x69.
-#define MPU6050_ADDR 0x68
-/*
-From Datasheet, page 40:
-Register (Hex): 6B
-Bit7 DEVICE_RESET
-Bit6 SLEEP
-Bit5 CYCLE
-Bit4 -
-Bit3 TEMP_DIS
-Bit2, Bit1, Bit0 CLKSEL[2:0]
-*/
-#define MPU6050_PWR_MGMT_1 0x6B
-/*
-Register (Hex) 19
-Bit7, Bit6, Bit5, Bit4, Bit3, Bit2, Bit1, Bit0: SMPLRT_DIV[7:0]
-*/
-#define MPU6050_SMPLRT_DIV 0x19
-/*
-From Datasheet, page 45:
-Register (Hex): 75
-Bit7 -
-Bit6, Bit5, Bit4, Bit3, Bit2, Bit1: WHO_AM_I[6:1]
-Bit0: -
-*/
-#define MPU6050_WHO_AM_I 0x75
-/*
-From Datasheet, page 30:
-Register (Hex) 41
-Bit7 Bit6 Bit5 Bit4 Bit3 Bit2 Bit1 Bit0: TEMP_OUT[15:8]
-Register (Hex) 42
-Bit7 Bit6 Bit5 Bit4 Bit3 Bit2 Bit1 Bit0: TEMP_OUT[7:0]
-*/
-#define MPU6050_TEMP_OUT_H 0x41
-#define MPU6050_TEMP_OUT_L 0x42
+#define LED_PIN    26
+#define BUTTON_PIN 14
+SemaphoreHandle_t xSemaphore = NULL;
+#define STEPS_GOAL 10
+// acuracy of a bit over 50%
 
-void app_main() {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = 33,  // select GPIO specific to your project
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_io_num = 32,  // select GPIO specific to your project
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed =
-            100000,  // select frequency specific to your project
-        // .clk_flags = 0,          /*!< Optional, you can use
-        // I2C_SCLK_SRC_FLAG_* flags to choose i2c source clock here. */
-    };
+// the reason why I have chosen this sampling frequency is because you run
+// roughly 170 steps/min so 300 will allow for over 3 steps a second or 180 per
+// min but I want to have over double that to notice the periodity, I chose 100
+// to really make sure it is enough without going WAY over board
+#define SAMPLING_PERIOD 100
+// I have chosen to run the algorithm every YYY because for the algorythm to
+// work nicelly i need a few periods, 15 seemed good
+#define ALGO_PERIOD 4500
+// number of samples to he held inside the buffer: 50 this is because i store
+// data every 100Ms and empty it every 4500Ms, 4500/100 = 45. that is only 32*45
+// bits or like 1,5Kbs. my board has 520KB of SRAM so it should fit well even
+// with some extra space
+#define BUFF_SIZE 50
+// minimum SD to avoid converging to 0
+#define MIN_SD 500
+// constant applied to SD to detect steps
+#define K 1.1
+// minimum time between steps, this value is chosen because... I the min steping
+// delay i'm expecting is 300MS ish
+#define MIN_INTRA_STEP_TIME 300
 
-    esp_err_t res = i2c_param_config(I2C_NUM_0, &conf);
-    ESP_ERROR_CHECK(res);
-    res = i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
-    ESP_ERROR_CHECK(res);
+struct circularBuffer buffer;
+int step_count = 0;
 
-    // configure power mode
-    // here we set all bits of the PWR_MGMT_1 register to 0
-    // create command
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    // start command
-    res = i2c_master_start(cmd);
-    ESP_ERROR_CHECK(res);
-    // set address + write and check for ack
-    res = i2c_master_write_byte(cmd, MPU6050_ADDR << 1 | I2C_MASTER_WRITE, 1);
-    ESP_ERROR_CHECK(res);
-    // write the register address and check for ack
-    res = i2c_master_write_byte(cmd, MPU6050_PWR_MGMT_1, 1);
-    ESP_ERROR_CHECK(res);
-    // write value of the regiter: 0, and check for ack
-    res = i2c_master_write_byte(cmd, 0x00, 1);
-    ESP_ERROR_CHECK(res);
-    // end of command
-    res = i2c_master_stop(cmd);
-    ESP_ERROR_CHECK(res);
-    // send the command, 1 second timeout
-    res = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_RATE_MS);
-    ESP_ERROR_CHECK(res);
-    // delete command now that it's not needed
-    i2c_cmd_link_delete(cmd);
-
-
-    // set the sampling frequency
-    // the sampling freq is gyro sampling freq / (1 + divider)
-    // setting divider to 250 leads to sampling freq. of 32 Hz
-    cmd = i2c_cmd_link_create();
-    res = i2c_master_start(cmd);
-    ESP_ERROR_CHECK(res);
-    res = i2c_master_write_byte(cmd, MPU6050_ADDR << 1 | I2C_MASTER_WRITE,
-                                1);  // WRITE bit set!
-    ESP_ERROR_CHECK(res);
-    res = i2c_master_write_byte(cmd, MPU6050_SMPLRT_DIV,
-                                1);  // write to SMPLRT_DIV
-    ESP_ERROR_CHECK(res);
-    res = i2c_master_write_byte(cmd, 250, 1);  // set SMPLRT_DIV to 250
-    ESP_ERROR_CHECK(res);
-    res = i2c_master_stop(cmd);
-    ESP_ERROR_CHECK(res);
-    printf("3\n");
-    res = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_RATE_MS);
-    // ESP_ERROR_CHECK(res);
-    i2c_cmd_link_delete(cmd);
-
+static void sampling_task(void *arg) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
     while (1) {
-        // read the latest sampled temperature
-        // we need to combine TEMP_OUT_L and TEMP_OUT_H into one 16-bit signed
-        // integer and then coonvert that into C using the formula: t = temp_out
-        // /340 + 36.53 create a little buffer where to store the answer
-        uint8_t buffer;
-        // holder of the temperature
-        int16_t tempRaw = 0;
-        // read low register
-        // send just the register number with no other data
-        cmd = i2c_cmd_link_create();
-        res = i2c_master_start(cmd);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_write_byte(cmd, MPU6050_ADDR << 1 | I2C_MASTER_WRITE,
-                                    1);  // WRITE bit set!
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_write_byte(cmd, MPU6050_TEMP_OUT_L,
-                                    1);  // read low first
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_stop(cmd);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_RATE_MS);
-        ESP_ERROR_CHECK(res);
-        i2c_cmd_link_delete(cmd);
-        // wait a little
-        vTaskDelay(10 / portTICK_RATE_MS);
-        // now read the answer
-        cmd = i2c_cmd_link_create();
-        res = i2c_master_start(cmd);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_write_byte(cmd, MPU6050_ADDR << 1 | I2C_MASTER_READ,
-                                    1);  // READ bit set!
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_read(cmd, &buffer, 1, I2C_MASTER_NACK);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_stop(cmd);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_RATE_MS);
-        ESP_ERROR_CHECK(res);
-        i2c_cmd_link_delete(cmd);
-        tempRaw = buffer;
-        // read high register
-        cmd = i2c_cmd_link_create();
-        res = i2c_master_start(cmd);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_write_byte(cmd, MPU6050_ADDR << 1 | I2C_MASTER_WRITE,
-                                    1);  // WRITE bit set!
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_write_byte(cmd, MPU6050_TEMP_OUT_H, 1);  // read high
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_stop(cmd);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_RATE_MS);
-        ESP_ERROR_CHECK(res);
-        i2c_cmd_link_delete(cmd);
-        vTaskDelay(10 / portTICK_RATE_MS);
-        cmd = i2c_cmd_link_create();
-        res = i2c_master_start(cmd);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_write_byte(cmd, MPU6050_ADDR << 1 | I2C_MASTER_READ,
-                                    1);  // READ bit set!
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_read(cmd, &buffer, 1, I2C_MASTER_NACK);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_stop(cmd);
-        ESP_ERROR_CHECK(res);
-        res = i2c_master_cmd_begin(I2C_NUM_0, cmd, 1000 / portTICK_RATE_MS);
-        ESP_ERROR_CHECK(res);
-        i2c_cmd_link_delete(cmd);
-        // combine high and low registers into a signed integer
-        tempRaw |= ((int16_t)buffer) << 8;
-        printf("temp raw is: %d\n", tempRaw);
-        // convert raw value to temperature
-        float temp = ((float)tempRaw) / 340 + 36.53;
-        printf("temperature is: %.2f C\n", temp);
-        vTaskDelay(500 / portTICK_RATE_MS);
+        // get the acceleration
+        // compute the magnitude
+        u_int32_t temp = getaccelmagnitude();
+        // place the magnitude into the buffer
+        addElement(&buffer, temp);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(SAMPLING_PERIOD));
     }
+}
+
+static void algo_task(void *arg) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    while (1) {
+        u_int32_t size = getsize(&buffer);
+        u_int32_t tail = buffer.tail;
+        // get size of the buffer
+        if (size > 0) {
+            // compute mean, here do NOT empty the queue when reading it!
+            double mean = 0;
+            for (int i = buffer.head; i != tail; i = inc(buffer.maxLength, i)) {
+                mean += buffer.data[i];
+            }
+            mean = mean / (double)size;
+            // compute SD, here queue must not be emptied yet
+            double sd = 0;
+            for (int i = buffer.head; i != tail; i = inc(buffer.maxLength, i)) {
+                sd += pow((buffer.data[i] - mean), 2);
+            }
+            sd = sqrt(sd / (double)size);
+            if (sd < MIN_SD) sd = MIN_SD;
+            // now do the step counting, while also emptying the queue
+            u_int32_t sample;
+            u_int32_t LastStep = MIN_INTRA_STEP_TIME;
+            for (int i = 0; i < size; i++) {
+                // get sample, removing it from queue
+                sample = removeHead(&buffer);
+                // if sample > mean + K * sd
+                if (sample > mean + K * sd) {
+                    if (LastStep + i * SAMPLING_PERIOD - LastStep >
+                        MIN_INTRA_STEP_TIME) {
+                        // AND if time between last step and this sample is >
+                        // MIN_INTRA_STEP_TIME step found! step_count++;
+
+                        step_count++;
+                        LastStep += i * SAMPLING_PERIOD;
+                    }
+                }
+            }
+        }
+        printf("step counter: %d\n", step_count);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(ALGO_PERIOD));
+    }
+}
+
+// button pressed ISR
+void button_isr_handler(void *arg) {
+    // give semaphore (pay attention: this is in an ISR!)
+    xSemaphoreGiveFromISR(xSemaphore, NULL);
+}
+
+void led_task(void *arg) {
+    while (1) {
+        // wait for semaphore
+        if (xSemaphoreTake(xSemaphore, portMAX_DELAY) == pdTRUE) {
+            // flash LED with sequence depending on if step_count > STEPS_GOAL
+            if (step_count > STEPS_GOAL) {
+                gpio_set_level(LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                gpio_set_level(LED_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                gpio_set_level(LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                gpio_set_level(LED_PIN, 0);
+            }
+        }
+    }
+}
+
+void app_main() {  // configure light sleep mode with esp_pm_configure()
+    esp_pm_config_esp32_t MYsleep_config = {
+        .max_freq_mhz = 80,
+        .min_freq_mhz = 20,
+        .light_sleep_enable = 1,
+    };
+    esp_err_t error = esp_pm_configure(&MYsleep_config);
+    ESP_ERROR_CHECK(error);
+
+    // button and led init
+    // create the binary semaphore
+    xSemaphore = xSemaphoreCreateBinary();
+    // start the task that will handle the button
+    xTaskCreate(led_task, "led_task", 2048, NULL, 10, NULL);
+    // configure button and led pins
+    gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    // setup the btn with an internal pullup
+    gpio_set_pull_mode(BUTTON_PIN, GPIO_PULLUP_ONLY);
+    // enable interrupt on falling (1->0) edge for button pin
+    gpio_set_intr_type(BUTTON_PIN, GPIO_INTR_NEGEDGE);
+    // install ISR service with default configuration
+    gpio_install_isr_service(0);
+    // attach the interrupt service routine
+    gpio_isr_handler_add(BUTTON_PIN, button_isr_handler, NULL);
+
+    // initialise the buffer
+    u_int32_t *data = (uint32_t *)malloc(BUFF_SIZE * sizeof(uint32_t));
+    initCircularBuffer(&buffer, data, BUFF_SIZE);
+
+    // initialise the I2C bus and the MPU6050
+    init();
+    // create sampling task
+    xTaskCreate(sampling_task, "sampling", 2048, NULL, 1, NULL);
+    xTaskCreate(algo_task, "algo", 2048, NULL, 0, NULL);
 }
