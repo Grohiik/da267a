@@ -75,19 +75,18 @@ static void algo_task(void *arg) {
             if (sd < MIN_SD) sd = MIN_SD;
             // now do the step counting, while also emptying the queue
             u_int32_t sample;
-            u_int32_t LastStep = MIN_INTRA_STEP_TIME;
+            u_int32_t LastStep = -MIN_INTRA_STEP_TIME;
             for (int i = 0; i < size; i++) {
                 // get sample, removing it from queue
                 sample = removeHead(&buffer);
                 // if sample > mean + K * sd
                 if (sample > mean + K * sd) {
-                    if (LastStep + i * SAMPLING_PERIOD - LastStep >
-                        MIN_INTRA_STEP_TIME) {
+                    if (i * SAMPLING_PERIOD - LastStep > MIN_INTRA_STEP_TIME) {
                         // AND if time between last step and this sample is >
                         // MIN_INTRA_STEP_TIME step found! step_count++;
 
                         step_count++;
-                        LastStep += i * SAMPLING_PERIOD;
+                        LastStep = i * SAMPLING_PERIOD;
                     }
                 }
             }
@@ -108,7 +107,7 @@ void led_task(void *arg) {
         // wait for semaphore
         if (xSemaphoreTake(xSemaphore, portMAX_DELAY) == pdTRUE) {
             // flash LED with sequence depending on if step_count > STEPS_GOAL
-            if (step_count > STEPS_GOAL) {
+            if (step_count >= STEPS_GOAL) {
                 gpio_set_level(LED_PIN, 1);
                 vTaskDelay(pdMS_TO_TICKS(500));
                 gpio_set_level(LED_PIN, 0);
